@@ -1,0 +1,274 @@
+1. Overview
+This document describes a technical design to synchronize UCMv2 case information back to the URP system.
+Today, URP creates a URP case and sends an alert to Kafka. UCMv2 consumes that alert and creates a UCMv2 case.
+The new requirement is: URP must display the corresponding UCMv2 case id and case status in its UI.
+The proposed solution is to introduce case lifecycle events from UCMv2 to Kafka, and a URP consumer that updates URP’s case records accordingly.
+
+
+
+2. Current Architecture
+2.1 Actors and Systems
+￼URP
+￼Allows users to create URP cases via UI.
+￼Publishes an alert message to a Kafka topic after a URP case is created.
+￼Kafka
+￼Topic urp-alerts (name illustrative) carries URP alerts to downstream systems.
+￼UCMv2
+￼Consumes alerts from urp-alerts.
+￼Creates UCMv2 cases based on the alert payload.
+2.2 Existing Flow
+￼User creates a case in URP UI.
+￼URP persists the URP case in its database.
+￼URP publishes an alert message to Kafka topic (e.g. urp-alerts).
+￼UCMv2 consumes alert from urp-alerts.
+￼UCMv2 creates a new UCMv2 case based on the alert.
+Gap: URP has no knowledge of the resulting UCMv2 case id or its lifecycle status.
+
+
+
+3. Requirements
+3.1 Functional Requirements
+￼Case ID Synchronization
+￼For each UCMv2 case created based on a URP alert, the UCMv2 case id must be synchronized back to URP and associated with the correct URP case.
+￼Case Status Synchronization
+￼Changes to the UCMv2 case status (e.g. OPEN, IN_PROGRESS, CLOSED) must be propagated back to URP.
+￼URP must display the latest UCMv2 case status in the URP UI.
+￼Correlation
+￼URP must be able to reliably correlate a UCMv2 case to the original URP case.
+￼Near Real-Time
+￼Status and id synchronization should be near real-time (e.g. within seconds, depending on Kafka lag and processing).
+3.2 Non-Functional Requirements
+￼Reliability: No data loss; eventually consistent.
+￼Idempotency: Re-processing the same event must not corrupt data.
+￼Scalability: Solution must handle the expected volume of cases/events.
+￼Observability: Metrics and logs for monitoring synchronization success and failures.
+￼Security: No sensitive data leaked; access controlled at Kafka and service level.
+
+
+
+4. High-Level Design
+4.1 Design Summary
+We introduce a reverse event channel from UCMv2 to URP using Kafka:
+￼New Kafka Topic: ucm-case-events
+￼Event Producer: UCMv2 publishes case lifecycle events to ucm-case-events whenever:
+￼a case is created, or
+￼a case status changes.
+￼Event Consumer: URP adds a new Kafka consumer that:
+￼reads events from ucm-case-events,
+￼uses a correlation key (from the original alert) to find the matching URP case,
+￼updates URP’s database with ucm_case_id and ucm_case_status.
+This leverages the existing Kafka-based integration pattern, keeps systems loosely coupled, and avoids direct synchronous dependencies between URP and UCMv2.
+
+
+
+5. Detailed Data Flow
+5.1 Case Creation Flow (Forward + Backward)
+￼URP – Case Creation
+￼User creates a case in URP.
+￼URP stores the new URP case with a unique primary key, for example:
+￼urp_case_id (internal ID).
+￼URP publishes an alert to Kafka (urp-alerts) including:
+￼urp_case_id
+￼other business fields.
+￼UCMv2 – Alert Consumption and Case Creation
+￼UCMv2 consumes alert from urp-alerts.
+￼UCMv2 creates a new UCMv2 case with its own ID:
+￼ucm_case_id
+￼UCMv2 persists the correlation with URP:
+￼It stores urp_case_id from the alert along with ucm_case_id.
+￼UCMv2 publishes a CaseCreated event to ucm-case-events:
+￼Contains both ucm_case_id and urp_case_id.
+￼URP – CaseCreated Event Handling
+￼URP consumer reads the CaseCreated event from ucm-case-events.
+￼URP finds the corresponding URP case via urp_case_id.
+￼URP updates the URP case record with:
+￼ucm_case_id
+￼ucm_case_status (initial value, e.g. OPEN).
+￼URP UI can now display UCMv2 case id and initial status.
+5.2 Case Status Update Flow
+￼UCMv2 – Status Change
+￼When UCMv2 case status changes (e.g. from OPEN to IN_PROGRESS or CLOSED), UCMv2:
+￼Updates its own case record.
+￼Publishes a CaseStatusChanged event to ucm-case-events.
+￼URP – Status Event Handling
+￼URP consumer processes the CaseStatusChanged event.
+￼URP locates the relevant URP case using urp_case_id (preferred) or ucm_case_id.
+￼URP updates:
+￼ucm_case_status to the latest status.
+￼Optionally, a ucm_status_last_updated_at timestamp.
+￼URP UI
+￼URP UI reads ucm_case_id and ucm_case_status from the URP database and displays them to the user.
+
+
+
+6. Event Model & Contracts
+6.1 Kafka Topic
+￼New topic: ucm-case-events (name subject to final naming conventions)
+￼Partitions: configurable based on expected volume (e.g. 6–12 partitions to start)
+￼Replication factor: 3 (typical for production)
+6.2 Event Types
+We define a generic envelope with a type field to support multiple event types on one topic.
+Common envelope:
+{
+  "eventId": "uuid",
+  "eventType": "CASE_CREATED | CASE_STATUS_CHANGED",
+  "eventTime": "2025-11-18T13:15:30Z",
+  "source": "UCMv2",
+  "payload": { ... }
+}
+
+6.2.1 CASE_CREATED Event Payload
+{
+  "ucmCaseId": "UCM-123456",
+  "urpCaseId": "URP-987654",
+  "initialStatus": "OPEN",
+  "createdAt": "2025-11-18T13:15:30Z",
+  "extraAttributes": {
+    "priority": "HIGH",
+    "caseType": "FRAUD"
+  }
+}
+
+Notes:
+￼urpCaseId must be populated from the original alert.
+￼initialStatus should be mapped to a shared status vocabulary.
+6.2.2 CASE_STATUS_CHANGED Event Payload
+{
+  "ucmCaseId": "UCM-123456",
+  "urpCaseId": "URP-987654",
+  "oldStatus": "OPEN",
+  "newStatus": "IN_PROGRESS",
+  "statusChangedAt": "2025-11-18T14:05:00Z",
+  "reason": "ASSIGNED_TO_ANALYST"
+}
+
+Notes:
+￼urpCaseId is preferred for correlation; ucmCaseId is a secondary key.
+￼reason is optional, but helpful for auditing.
+
+
+
+7. URP Changes
+7.1 Data Model
+Extend URP’s case table, e.g.:
+￼ucm_case_id  VARCHAR, nullable 
+￼ucm_case_status  VARCHAR, nullable 
+￼ucm_status_last_updated_at  TIMESTAMP, nullable 
+Optional:
+￼A status history table for audit, if needed:
+￼urp_case_id
+￼ucm_case_id
+￼status
+￼changed_at
+￼source (e.g. UCMv2)
+7.2 New Kafka Consumer
+Implement a new URP service component, e.g. UcmCaseEventConsumer:
+￼Subscribes to ucm-case-events.
+￼For each message:
+￼Validate schema and required fields.
+￼Deduplicate by eventId (e.g. store processed event ids or use idempotent upsert by (urpCaseId, eventType, eventTime)).
+￼Find the URP case via urpCaseId.
+￼Apply changes:
+￼If CASE_CREATED:
+￼Set ucm_case_id, ucm_case_status, ucm_status_last_updated_at.
+￼If CASE_STATUS_CHANGED:
+￼Update ucm_case_status, ucm_status_last_updated_at.
+￼Handle missing URP case:
+￼Log as warning, optionally send to a dead-letter topic.
+7.3 URP UI
+￼Add UI fields on the URP case detail page:
+￼“UCM Case ID”: ucm_case_id
+￼“UCM Case Status”: ucm_case_status
+￼Optionally:
+￼Tooltip or mapping for user-friendly status labels (e.g. IN_PROGRESS → “In progress”).
+￼A small “Last synced time” pulled from ucm_status_last_updated_at.
+
+
+
+8. UCMv2 Changes
+8.1 Persist Correlation
+￼Ensure UCMv2 stores urp_case_id along with each ucm_case_id when creating the case.
+￼This can be:
+￼A dedicated column urp_case_id in the UCMv2 case table.
+￼Or a correlation table mapping ucm_case_id ↔ urp_case_id.
+8.2 Event Publisher
+Add a publishing component, e.g. UcmCaseEventPublisher:
+￼On Case Creation
+￼After successfully persisting the UCMv2 case:
+￼Build a CASE_CREATED event.
+￼Publish to ucm-case-events.
+￼On Case Status Change
+￼Whenever UCMv2 case status changes:
+￼Build a CASE_STATUS_CHANGED event including both IDs.
+￼Publish to ucm-case-events.
+￼Idempotency & Reliability
+￼Ensure publisher is:
+￼transactional with DB changes where possible (e.g. outbox pattern), or
+￼at-least-once, with URP side idempotent updates.
+
+
+
+9. Error Handling & Retry
+9.1 UCMv2 Side
+￼If publishing to Kafka fails:
+￼Use retry with backoff.
+￼Optionally, store unsent events in an outbox table and have a background job flush them to Kafka.
+9.2 URP Side
+￼If processing of an event fails (e.g. DB unavailable):
+￼Use Kafka consumer retries.
+￼For repeated failures, send the event to a dead-letter topic (e.g. ucm-case-events-dlq) and raise alerts.
+￼If no URP case is found for urpCaseId:
+￼Log with correlation info.
+￼Optionally, send to DLQ for investigation.
+￼Do not fail the whole consumer (treat as a business-level warning).
+
+
+
+10. Security & Access Control
+￼Kafka ACLs:
+￼UCMv2 service principal: produce to ucm-case-events.
+￼URP service principal: consume from ucm-case-events.
+￼Data:
+￼Only propagate necessary fields to URP (no sensitive data if not required).
+￼Encryption:
+￼Kafka traffic should use TLS where available.
+￼Audit:
+￼Log event ids and case ids for traceability.
+
+
+
+11. Observability
+11.1 Metrics
+Example metrics to expose:
+￼For UCMv2:
+￼ucm_case_events_published_total{type=...}
+￼ucm_case_event_publish_failures_total
+￼For URP:
+￼ucm_case_events_consumed_total{type=...}
+￼ucm_case_events_failed_total{reason=...}
+￼Lag metrics from Kafka consumer group.
+11.2 Logging
+￼Correlate logs by:
+￼eventId
+￼urpCaseId
+￼ucmCaseId
+￼Log at INFO for successful flows, WARN/ERROR for failures.
+
+
+
+12. Open Questions / Decisions
+￼Status Vocabulary
+￼Need a finalized shared set of statuses:
+￼e.g. OPEN, IN_PROGRESS, ON_HOLD, CLOSED, REJECTED
+￼And mapping rules if UCMv2 has a richer internal status model.
+￼Case Re-Assignment / Re-Creation
+￼What happens if the same urp_case_id leads to multiple UCMv2 cases?
+￼Current assumption: 1:1 mapping; if not, we may need a separate mapping table in URP.
+￼Historical Backfill
+￼Do we need to backfill UCMv2 case ids and statuses for existing URP cases?
+￼If yes, define a one-time batch process or export/import approach.
+
+
+
+If you can share any existing field names or topic names (e.g. the actual URP alert schema), I can adapt this design and the JSON schemas to match your real model more closely.
+
